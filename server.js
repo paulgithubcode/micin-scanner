@@ -1,346 +1,235 @@
-const BOT_TOKEN = "8705907765:AAGTBF2ka5cgnZ9jzcnIlXnVxmqjtqc0X1k";
-const CHAT_ID = "8241745751";
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHAT_ID = process.env.CHAT_ID;
 
-const sentCoins = {};
+let sentCoins = {};
 
 function sleep(ms){
-    return new Promise(r=>setTimeout(r,ms));
+  return new Promise(r=>setTimeout(r,ms));
 }
 
-// ======================================
-// GET PAIRS
-// ======================================
+// ============================
+// USDT → IDR RATE
+// ============================
 
-async function getPairs(){
+async function getUSDTIDR(){
+
+  try{
 
     const res = await fetch(
-        "https://indodax.com/tradingview/search_v2"
+      "https://api.binance.com/api/v3/ticker/price?symbol=USDTIDR"
     );
 
     const data = await res.json();
 
-    return data
-        .filter(x=>x.symbol.endsWith("IDR"))
-        .map(x=>x.symbol);
+    return parseFloat(data.price);
+
+  }catch(e){
+
+    console.log("USDTIDR error, fallback");
+
+    return 16000; // fallback kalau API gagal
+
+  }
 
 }
 
-// ======================================
-
-function toBinance(sym){
-
-    return sym.replace("IDR","USDT");
-
-}
-
-// ======================================
+// ============================
+// BINANCE KLINES
+// ============================
 
 async function getKlines(symbol, interval){
 
-    const urls = [
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=50`;
 
-        `https://api1.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=50`,
+  const res = await fetch(url);
 
-        `https://api2.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=50`,
-
-        `https://api3.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=50`
-
-    ];
-
-    for(const url of urls){
-
-        try{
-
-            const res = await fetch(url);
-
-            if(res.ok){
-
-                return await res.json();
-
-            }
-
-        }catch(err){}
-
-    }
-
-    return null;
+  return await res.json();
 
 }
 
-// ======================================
+// ============================
 
 function avgVol(data){
 
-    let v = data
-        .slice(-20)
-        .map(c=>parseFloat(c[5]));
+  let v = data.slice(-20).map(c=>+c[5]);
 
-    return v.reduce((a,b)=>a+b,0)/20;
+  return v.reduce((a,b)=>a+b,0)/20;
 
 }
-
-// ======================================
 
 function breakout(data){
 
-    let last = parseFloat(data.at(-1)[4]);
+  let last = +data.at(-1)[4];
 
-    let high = Math.max(
-        ...data
-        .slice(-20,-1)
-        .map(c=>parseFloat(c[2]))
-    );
+  let high = Math.max(
+    ...data.slice(-20,-1).map(c=>+c[2])
+  );
 
-    return last > high;
+  return last > high;
 
 }
-
-// ======================================
-
-function whale(data){
-
-    let curr = parseFloat(data.at(-1)[5]);
-
-    let prev = parseFloat(data.at(-2)[5]);
-
-    return curr > prev*2;
-
-}
-
-// ======================================
 
 function change(data){
 
-    let a = parseFloat(data.at(-1)[4]);
+  let a = +data.at(-1)[4];
 
-    let b = parseFloat(data.at(-2)[4]);
+  let b = +data.at(-2)[4];
 
-    return ((a-b)/b)*100;
+  return ((a-b)/b)*100;
 
 }
 
-// ======================================
+// ============================
 // TELEGRAM
-// ======================================
+// ============================
 
-async function sendTelegram(message){
+async function sendTelegram(msg){
 
-    try{
+  await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+    {
+      method:"POST",
+      headers:{
+        "Content-Type":"application/json"
+      },
+      body: JSON.stringify({
+        chat_id: CHAT_ID,
+        text: msg
+      })
+    }
+  );
 
-        const res = await fetch(
+}
 
-            `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+// ============================
+// SCAN COIN
+// ============================
 
-            {
-                method:"POST",
+async function scan(symbol){
 
-                headers:{
-                    "Content-Type":"application/json"
-                },
+  try{
 
-                body:JSON.stringify({
+    let d5 = await getKlines(symbol,"5m");
 
-                    chat_id:CHAT_ID,
+    let d15 = await getKlines(symbol,"15m");
 
-                    text:message
+    if(!d5 || !d15) return;
 
-                })
-            }
+    // =========================
+    // PRICE USDT
+    // =========================
 
-        );
+    let priceUSDT = +d5.at(-1)[4];
 
-        const data = await res.json();
+    let usdtIDR = await getUSDTIDR();
 
-        console.log("TELEGRAM:", data.ok);
+    let priceIDR = priceUSDT * usdtIDR;
 
-    }catch(err){
+    // =========================
+    // RVOL
+    // =========================
 
-        console.log(err);
+    let rvol5 = +d5.at(-1)[5] / avgVol(d5);
+
+    let rvol15 = +d15.at(-1)[5] / avgVol(d15);
+
+    let br5 = breakout(d5);
+
+    let ch = change(d5);
+
+    let status = "SKIP";
+
+    // =========================
+    // LOGIC
+    // =========================
+
+    if(rvol5 > 2 && br5 && rvol15 > 1.2 && ch < 5){
+
+      status = "🔥 STRONG CONFIRM";
 
     }
 
-}
+    console.log(symbol, status);
 
-// ======================================
-// PROCESS
-// ======================================
+    // =========================
+    // TELEGRAM ALERT
+    // =========================
 
-async function process(pair){
+    if(status === "🔥 STRONG CONFIRM"){
 
-    try{
+      if(!sentCoins[symbol]){
 
-        let sym = toBinance(pair);
-
-        let data5 = await getKlines(sym,"5m");
-
-        let data15 = await getKlines(sym,"15m");
-
-        if(!data5 || !data15) return;
-
-        let last = parseFloat(
-            data5.at(-1)[4]
-        );
-
-        let rvol5 =
-            parseFloat(data5.at(-1)[5]) /
-            avgVol(data5);
-
-        let rvol15 =
-            parseFloat(data15.at(-1)[5]) /
-            avgVol(data15);
-
-        let br5 = breakout(data5);
-
-        let br15 = breakout(data15);
-
-        let wh = whale(data5);
-
-        let ch = change(data5);
-
-        let status = "SKIP";
-
-        if(
-            rvol5 > 2 &&
-            br5 &&
-            rvol15 > 1.2 &&
-            ch < 5
-        ){
-
-            status = "STRONG CONFIRM";
-
-        }
-        else if(
-            rvol5 > 2 &&
-            ch < 3 &&
-            !br15
-        ){
-
-            status = "EARLY";
-
-        }
-        else if(
-            wh &&
-            ch < 4
-        ){
-
-            status = "WHALE";
-
-        }
-        else if(
-            br5 &&
-            rvol5 < 1.5
-        ){
-
-            status = "FAKE";
-
-        }
-
-        console.log(
-            pair,
-            rvol5.toFixed(2),
-            rvol15.toFixed(2),
-            status
-        );
-
-        // ======================================
-        // TELEGRAM ALERT
-        // ======================================
-
-        if(status === "STRONG CONFIRM"){
-
-            if(!sentCoins[pair]){
-
-                let harga = new Intl.NumberFormat(
-                    'id-ID',
-                    {
-                        style:'currency',
-                        currency:'IDR'
-                    }
-                ).format(last);
-
-                let msg =
+        let msg =
 `🚀 STRONG CONFIRM
 
-Coin      : ${pair}
+Coin   : ${symbol}
 
-Harga     : ${harga}
+Price  : Rp ${priceIDR.toLocaleString("id-ID")}
 
-RVOL 5M   : ${rvol5.toFixed(2)}
+PriceUSDT : ${priceUSDT}
 
-RVOL 15M  : ${rvol15.toFixed(2)}
+RVOL5  : ${rvol5.toFixed(2)}
 
-Status    : ${status}
+RVOL15 : ${rvol15.toFixed(2)}
 
-Time      :
-${new Date().toLocaleString()}
+Status : ${status}
+
+Time   : ${new Date().toLocaleString()}
 `;
 
-                await sendTelegram(msg);
+        await sendTelegram(msg);
 
-                sentCoins[pair] = true;
+        sentCoins[symbol] = true;
 
-                console.log(
-                    "ALERT SENT:",
-                    pair
-                );
+      }
 
-            }
+    }else{
 
-        }else{
-
-            sentCoins[pair] = false;
-
-        }
-
-    }catch(err){
-
-        console.log(err);
+      sentCoins[symbol] = false;
 
     }
 
-}
+  }catch(e){
 
-// ======================================
-// SCAN
-// ======================================
+    console.log("error", symbol);
 
-async function scan(){
-
-    console.log("START SCAN");
-
-    const pairs = await getPairs();
-
-    console.log("TOTAL:", pairs.length);
-
-    for(let i=0;i<pairs.length;i++){
-
-        await process(pairs[i]);
-
-        await sleep(200);
-
-    }
-
-    console.log("DONE");
+  }
 
 }
 
-// ======================================
+// ============================
+// COINS
+// ============================
+
+const coins = [
+  "BTCUSDT",
+  "ETHUSDT",
+  "SOLUSDT",
+  "BNBUSDT",
+  "XRPUSDT"
+];
+
+// ============================
 // LOOP
-// ======================================
+// ============================
 
 async function start(){
 
-    while(true){
+  while(true){
 
-        await scan();
+    for(let c of coins){
 
-        console.log(
-            "WAIT 15 MINUTES..."
-        );
+      await scan(c);
 
-//        await sleep(900000);
+      await sleep(500);
 
     }
+
+    console.log("cycle done");
+
+    await sleep(60000);
+
+  }
 
 }
 
