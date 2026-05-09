@@ -274,9 +274,10 @@ async function start(){
 
     }
 
-    console.log("cycle done");
+	  const duration =
+		((Date.now() - startTime)/1000).toFixed(2);
 
-    await sleep(60000);
+	  console.log(`cycle done (${duration}s)`);
 
   }
 
